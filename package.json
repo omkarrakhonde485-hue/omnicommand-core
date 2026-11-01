@@ -1,0 +1,13 @@
+{
+  "name": "omnicommand-core",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Durable Telegram ingress and state engine for personal automation",
+  "main": "api/telegram-webhook.js",
+  "scripts": {
+    "test": "echo \"Run verification curl tests against deployed endpoint\""
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
