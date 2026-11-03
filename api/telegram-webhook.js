@@ -204,7 +204,7 @@ Determine if the user wants to schedule a calendar event.
 }
 
 /**
- * Extracts structured revision & mistake takeaways using Gemini 3.5 Flash Lite.
+ * Decomposes technical mistake & study takeaways for SynapsePrep.
  */
 async function parseSynapseWithGemini(userText) {
     const apiKey = String(process.env.GEMINI_API_KEY || '').trim().replace(/^["']|["']$/g, '');
@@ -213,14 +213,9 @@ async function parseSynapseWithGemini(userText) {
     const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-    const systemPrompt = `You are SynapsePrep, an expert technical learning and mistake-analysis engine for an AI & Data Science engineer.
-Analyze the user's raw study note, bug experience, or practice problem mistake.
-Extract:
-1. category: Choose strictly from 'MISTAKE', 'CONCEPT', 'SYSTEM_DESIGN', 'TOOLING'. Default to 'MISTAKE' if an error occurred.
-2. subject: Concise domain tag (e.g., 'DSA - Binary Trees', 'Python - AsyncIO', 'PostgreSQL - Indexing', 'Machine Learning - Loss Functions').
-3. core_concept: Clear 1-sentence technical takeaway.
-4. mistake_pattern: What went wrong, the faulty assumption, or the trap encountered (null if purely a concept note).
-5. remedy_action: Concrete, actionable rule or mental check to execute next time to prevent this mistake or recall the concept.`;
+    const systemPrompt = `You are SynapsePrep, an expert technical learning engine.
+Analyze the user's raw study note or practice mistake.
+Extract category ('MISTAKE', 'CONCEPT', 'SYSTEM_DESIGN', 'TOOLING'), subject, core_concept, mistake_pattern, and remedy_action.`;
 
     const responseSchema = {
         type: "OBJECT",
@@ -262,12 +257,86 @@ Extract:
     return JSON.parse(textOutput);
 }
 
+/**
+ * Evaluates business lead feasibility and margins for VenturePulse.
+ */
+async function parseVentureWithGemini(userText) {
+    const apiKey = String(process.env.GEMINI_API_KEY || '').trim().replace(/^["']|["']$/g, '');
+    if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
+
+    const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const systemPrompt = `You are VenturePulse, a pragmatic technical feasibility and commercial evaluator for an AI & automation engineering consultancy.
+Analyze the provided client inquiry, local business bottleneck, or digital project opportunity.
+Extract:
+1. business_name: Extracted name or 'Local Client / Prospect' if unnamed.
+2. sector: Industry sector (e.g., 'Retail / Food & Beverage', 'Healthcare', 'Logistics', 'Education', 'Real Estate').
+3. problem_statement: Direct 1-2 sentence definition of the operational bottleneck.
+4. feasibility_score: 0-100 score based on building with React, Node.js, Python, Supabase, Google Apps Script, and Telegram bots.
+5. margin_potential: 'HIGH', 'MEDIUM', or 'LOW' based on likely pricing versus engineering maintenance.
+6. implementation_effort: 'LOW' (< 1 week), 'MEDIUM' (1-3 weeks), or 'HIGH' (> 1 month).
+7. recommended_solution: Concrete technical architecture (tools, workflows, integrations).
+8. primary_risk: Biggest execution risk (e.g., manual client adoption, payment gateway compliance, API quotas).`;
+
+    const responseSchema = {
+        type: "OBJECT",
+        properties: {
+            business_name: { type: "STRING" },
+            sector: { type: "STRING" },
+            problem_statement: { type: "STRING" },
+            feasibility_score: { type: "INTEGER" },
+            margin_potential: { type: "STRING", enum: ["HIGH", "MEDIUM", "LOW"] },
+            implementation_effort: { type: "STRING", enum: ["LOW", "MEDIUM", "HIGH"] },
+            recommended_solution: { type: "STRING" },
+            primary_risk: { type: "STRING" }
+        },
+        required: [
+            "business_name",
+            "sector",
+            "problem_statement",
+            "feasibility_score",
+            "margin_potential",
+            "implementation_effort",
+            "recommended_solution",
+            "primary_risk"
+        ]
+    };
+
+    const payload = {
+        contents: [{ role: "user", parts: [{ text: `${systemPrompt}\n\nOPPORTUNITY / CLIENT INQUIRY:\n"${userText}"` }] }],
+        generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: responseSchema,
+            temperature: 0.1
+        }
+    };
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(8000)
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Gemini API error (${response.status}): ${errText}`);
+    }
+
+    const result = await response.json();
+    const textOutput = result.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!textOutput) throw new Error('Empty response from Gemini');
+
+    return JSON.parse(textOutput);
+}
+
 module.exports = async function handler(req, res) {
     const startTime = Date.now();
 
     try {
         if (req.method === 'GET') {
-            return res.status(200).json({ status: 'healthy', milestone: '7a', service: 'OmniCommand+SynapsePrep' });
+            return res.status(200).json({ status: 'healthy', milestone: '8a', service: 'OmniCommand+Synapse+Venture' });
         }
 
         if (req.method !== 'POST') {
@@ -299,7 +368,7 @@ module.exports = async function handler(req, res) {
 
         const allowedUid = String(process.env.ALLOWED_TELEGRAM_UID || '').trim();
 
-        // 3. Branch A: Handle Approval Callbacks (Calendar Approval)
+        // 3. Branch A: Handle Approval Callbacks
         if (payload.callback_query) {
             const cb = payload.callback_query;
             const senderId = cb.from && cb.from.id ? String(cb.from.id) : '';
@@ -439,12 +508,12 @@ module.exports = async function handler(req, res) {
         }
 
         if (text === '/ping') {
-            await sendTelegramMessage(chatId, '✅ Pong! OmniCommand Milestone 7A is live.');
+            await sendTelegramMessage(chatId, '✅ Pong! OmniCommand Milestone 8A is live.');
             await recordTelemetry('OmniCommand_Ingress', 'SUCCESS', Date.now() - startTime, 'Ping command');
             return res.status(200).json({ ok: true, command: '/ping' });
         }
 
-        // 5. DETERMINISTIC ROUTING: SynapsePrep (/prep, /mistake, #prep, #mistake)
+        // 5. DETERMINISTIC ROUTING 1: SynapsePrep (/mistake, /prep, #mistake, #prep)
         const isSynapseCommand = /^(\/mistake|\/prep|#mistake|#prep)\b/i.test(text);
 
         if (isSynapseCommand) {
@@ -466,7 +535,6 @@ module.exports = async function handler(req, res) {
                 return res.status(200).json({ ok: true, error: 'ai_parse_failed' });
             }
 
-            // Persist to Supabase synapse_prep table
             const prepInsert = await supabaseRequest('synapse_prep', 'POST', {
                 category: synapseData.category,
                 subject: synapseData.subject,
@@ -485,7 +553,6 @@ module.exports = async function handler(req, res) {
             const savedRecord = Array.isArray(prepInsert.data) ? prepInsert.data[0] : prepInsert.data;
             const prepId = savedRecord ? savedRecord.prep_id : 'saved';
 
-            // Send structured confirmation card to Telegram
             const cardHtml = `🧠 <b>SynapsePrep Captured: [${escapeHtml(synapseData.category)}]</b>\n\n` +
                 `📚 <b>Subject:</b> <code>${escapeHtml(synapseData.subject)}</code>\n` +
                 `💡 <b>Core Concept:</b> ${escapeHtml(synapseData.core_concept)}\n` +
@@ -499,7 +566,69 @@ module.exports = async function handler(req, res) {
             return res.status(200).json({ ok: true, type: 'synapse_captured', prep_id: prepId });
         }
 
-        // 6. DEFAULT ROUTING: Calendar Scheduling Pipeline
+        // 6. DETERMINISTIC ROUTING 2: VenturePulse (/venture, /lead, #venture, #lead)
+        const isVentureCommand = /^(\/venture|\/lead|#venture|#lead)\b/i.test(text);
+
+        if (isVentureCommand) {
+            const cleanInput = text.replace(/^(\/venture|\/lead|#venture|#lead)\s*/i, '').trim();
+
+            if (!cleanInput) {
+                const usageHelp = `🚀 <b>VenturePulse Usage</b>\n\nSend a business inquiry or project idea:\n<code>/venture Local bakery wants pre-order system for bread, losing 30% morning orders to phone busy lines, budget 20k INR</code>`;
+                await sendTelegramMessage(chatId, usageHelp, null, 'HTML');
+                return res.status(200).json({ ok: true, status: 'empty_venture_input' });
+            }
+
+            let ventureData = null;
+            try {
+                ventureData = await parseVentureWithGemini(cleanInput);
+            } catch (aiErr) {
+                console.error('VenturePulse AI Error:', aiErr);
+                await sendTelegramMessage(chatId, `⚠️ VenturePulse AI parsing failed: ${aiErr.message}`);
+                await recordTelemetry('VenturePulse_Parser', 'AI_ERROR', Date.now() - startTime, aiErr.message);
+                return res.status(200).json({ ok: true, error: 'ai_parse_failed' });
+            }
+
+            // Persist to Supabase venture_pulse table
+            const ventureInsert = await supabaseRequest('venture_pulse', 'POST', {
+                business_name: ventureData.business_name,
+                sector: ventureData.sector,
+                raw_input: cleanInput,
+                problem_statement: ventureData.problem_statement,
+                feasibility_score: ventureData.feasibility_score,
+                margin_potential: ventureData.margin_potential,
+                implementation_effort: ventureData.implementation_effort,
+                recommended_solution: ventureData.recommended_solution,
+                primary_risk: ventureData.primary_risk,
+                status: 'EVALUATED'
+            }, { Prefer: 'return=representation' });
+
+            if (!ventureInsert.ok) {
+                console.error('Failed to insert into venture_pulse:', ventureInsert.data);
+                await recordTelemetry('VenturePulse_Storage', 'DB_ERROR', Date.now() - startTime, JSON.stringify(ventureInsert.data));
+                return res.status(500).json({ error: 'Database persistence failed' });
+            }
+
+            const savedVenture = Array.isArray(ventureInsert.data) ? ventureInsert.data[0] : ventureInsert.data;
+            const leadId = savedVenture ? savedVenture.lead_id : 'saved';
+
+            // Send structured scorecard to Telegram
+            const cardHtml = `🚀 <b>VenturePulse Evaluation: ${escapeHtml(ventureData.business_name)}</b>\n\n` +
+                `🏢 <b>Sector:</b> <code>${escapeHtml(ventureData.sector)}</code>\n` +
+                `🎯 <b>Feasibility Score:</b> <b>${ventureData.feasibility_score}/100</b>\n` +
+                `💰 <b>Margin Potential:</b> <code>${escapeHtml(ventureData.margin_potential)}</code>\n` +
+                `⏱️ <b>Effort Level:</b> <code>${escapeHtml(ventureData.implementation_effort)}</code>\n\n` +
+                `📌 <b>Problem:</b>\n${escapeHtml(ventureData.problem_statement)}\n\n` +
+                `🛠️ <b>Recommended Solution:</b>\n${escapeHtml(ventureData.recommended_solution)}\n\n` +
+                `⚠️ <b>Key Risk / Hurdle:</b>\n${escapeHtml(ventureData.primary_risk)}\n\n` +
+                `📄 <i>Staged in VenturePulse. (Lead ID: <code>${leadId.substring(0, 8)}</code>)</i>`;
+
+            await sendTelegramMessage(chatId, cardHtml, null, 'HTML');
+            await recordTelemetry('VenturePulse_Storage', 'SUCCESS', Date.now() - startTime, `Lead: ${ventureData.business_name} (${ventureData.feasibility_score}/100)`);
+
+            return res.status(200).json({ ok: true, type: 'venture_evaluated', lead_id: leadId });
+        }
+
+        // 7. DEFAULT ROUTING: Calendar Scheduling Pipeline
         let parsedData = null;
         try {
             parsedData = await parseEventWithGemini(text);
@@ -511,7 +640,7 @@ module.exports = async function handler(req, res) {
         }
 
         if (!parsedData.is_calendar_event) {
-            await sendTelegramMessage(chatId, `ℹ️ Received: "${text}"\n\n(Not a calendar command. Use <code>/mistake</code> or <code>/prep</code> to save study notes.)`, null, 'HTML');
+            await sendTelegramMessage(chatId, `ℹ️ Received: "${text}"\n\n(Not a calendar command. Use <code>/mistake</code> for study notes or <code>/venture</code> for business inquiries.)`, null, 'HTML');
             await recordTelemetry('OmniCommand_Parser', 'NOT_AN_EVENT', Date.now() - startTime, text);
             return res.status(200).json({ ok: true, type: 'non_calendar' });
         }
