@@ -93,14 +93,102 @@ async function recordTelemetry(workflow, outcome, durationMs, notes) {
 }
 
 /**
+ * Fetches failed jobs and step details from GitHub REST API.
+ */
+async function fetchFailedJobDetails(repoFullName, runId) {
+    const pat = process.env.GITHUB_PAT;
+    if (!pat || !runId) return null;
+
+    try {
+        const url = `https://api.github.com/repos/${repoFullName}/actions/runs/${runId}/jobs`;
+        const res = await fetch(url, {
+            headers: {
+                'Accept': 'application/vnd.github+json',
+                'Authorization': `Bearer ${pat}`,
+                'User-Agent': 'OmniCommand-SentinelDev'
+            },
+            signal: AbortSignal.timeout(4000)
+        });
+
+        if (!res.ok) return null;
+        const data = await res.json();
+
+        // Find failed jobs and isolate failed steps
+        const failedJobs = (data.jobs || []).filter(j => j.conclusion === 'failure');
+        if (failedJobs.length === 0) return null;
+
+        const summary = failedJobs.map(job => {
+            const failedSteps = (job.steps || []).filter(s => s.conclusion === 'failure').map(s => s.name);
+            return `Job "${job.name}" failed on steps: ${failedSteps.join(', ') || 'unknown'}`;
+        }).join('\n');
+
+        return summary;
+    } catch (err) {
+        console.error('GitHub API job fetch error:', err.message);
+        return null;
+    }
+}
+
+/**
+ * Diagnoses build failure root cause using gemini-3.5-flash-lite.
+ */
+async function diagnoseFailureWithGemini(failureContext) {
+    const apiKey = String(process.env.GEMINI_API_KEY || '').trim().replace(/^["']|["']$/g, '');
+    if (!apiKey) return null;
+
+    const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const systemPrompt = `You are SentinelDev, an expert CI/CD failure diagnostician.
+Analyze the provided GitHub Actions workflow failure metadata.
+Identify the root cause, the most likely culprit (file, package, or configuration), and a concrete fix command or code adjustment.
+Keep the explanation direct, grounded, and concise.`;
+
+    const responseSchema = {
+        type: "OBJECT",
+        properties: {
+            root_cause: { type: "STRING" },
+            likely_culprit: { type: "STRING" },
+            suggested_fix: { type: "STRING" }
+        },
+        required: ["root_cause", "likely_culprit", "suggested_fix"]
+    };
+
+    const payload = {
+        contents: [
+            { role: "user", parts: [{ text: `${systemPrompt}\n\nFAILURE CONTEXT:\n${failureContext}` }] }
+        ],
+        generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: responseSchema,
+            temperature: 0.1
+        }
+    };
+
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(6000)
+        });
+
+        if (!res.ok) return null;
+        const result = await res.json();
+        const textOutput = result.candidates?.[0]?.content?.parts?.[0]?.text;
+        return textOutput ? JSON.parse(textOutput) : null;
+    } catch (err) {
+        console.error('Gemini diagnostic triage error:', err.message);
+        return null;
+    }
+}
+
+/**
  * Dispatches an HTML-formatted notification to Telegram.
  */
 async function sendTelegramAlert(chatId, htmlText) {
     const botToken = process.env.TELEGRAM_BOT_TOKEN;
-    if (!botToken) {
-        console.error('Missing TELEGRAM_BOT_TOKEN');
-        return false;
-    }
+    if (!botToken) return false;
 
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
     const res = await fetch(url, {
@@ -122,7 +210,7 @@ module.exports = async function handler(req, res) {
     try {
         // 1. Health check for GET probes
         if (req.method === 'GET') {
-            return res.status(200).json({ status: 'healthy', milestone: '5a', service: 'SentinelDev' });
+            return res.status(200).json({ status: 'healthy', milestone: '5b', service: 'SentinelDev' });
         }
 
         if (req.method !== 'POST') {
@@ -182,26 +270,40 @@ module.exports = async function handler(req, res) {
         const action = payload.action;
         const run = payload.workflow_run;
 
-        // Only process completed workflow runs
         if (action !== 'completed' || !run) {
             return res.status(200).json({ ok: true, ignored_action: action });
         }
 
-        const conclusion = run.conclusion; // 'success', 'failure', 'timed_out', 'cancelled'
+        const conclusion = run.conclusion;
         const repoName = payload.repository ? payload.repository.full_name : 'Unknown Repo';
         const workflowName = run.name || 'Unnamed Workflow';
         const branch = run.head_branch || 'unknown';
         const commitMsg = run.head_commit ? run.head_commit.message.split('\n')[0] : 'No commit message';
         const author = run.head_commit && run.head_commit.author ? run.head_commit.author.name : 'Unknown Author';
         const runUrl = run.html_url || '';
+        const runId = run.id;
 
-        // If workflow succeeded or was cancelled, log and acknowledge without spamming Telegram
         if (conclusion !== 'failure' && conclusion !== 'timed_out') {
             await recordTelemetry('SentinelDev_Workflow', 'WORKFLOW_SUCCESS', Date.now() - startTime, `${repoName} - ${workflowName}: ${conclusion}`);
             return res.status(200).json({ ok: true, conclusion });
         }
 
-        // 8. Workflow Failure Triage & Staging (with explicit error checking)
+        // 8. Triage & Root Cause Analysis via GitHub API + Gemini
+        const stepDetails = await fetchFailedJobDetails(repoName, runId);
+        const failureContext = `
+Repository: ${repoName}
+Workflow: ${workflowName}
+Branch: ${branch}
+Conclusion: ${conclusion}
+Commit Message: "${commitMsg}"
+Author: ${author}
+Run URL: ${runUrl}
+${stepDetails ? `Job Failure Details:\n${stepDetails}` : 'Job Details: Direct log step details not available'}
+`;
+
+        const triage = await diagnoseFailureWithGemini(failureContext);
+
+        // 9. Workflow Failure Staging in automation_jobs
         const jobId = crypto.randomUUID();
         const jobInsert = await supabaseRequest(
             'automation_jobs',
@@ -219,7 +321,8 @@ module.exports = async function handler(req, res) {
                     conclusion,
                     run_url: runUrl,
                     commit: commitMsg,
-                    author
+                    author,
+                    triage_diagnosis: triage || 'Diagnostic unavailable'
                 },
                 status: 'RECEIVED'
             },
@@ -228,41 +331,46 @@ module.exports = async function handler(req, res) {
 
         if (!jobInsert.ok) {
             console.error('Failed to insert into automation_jobs:', jobInsert.data);
-            await recordTelemetry(
-                'SentinelDev_Workflow',
-                'JOB_INSERT_FAILED',
-                Date.now() - startTime,
-                JSON.stringify(jobInsert.data)
-            );
+            await recordTelemetry('SentinelDev_Workflow', 'JOB_INSERT_FAILED', Date.now() - startTime, JSON.stringify(jobInsert.data));
             return res.status(500).json({
                 error: 'Database persistence failed for automation_jobs',
                 details: jobInsert.data
             });
         }
 
-        // 9. Dispatch Read-Only Telegram Alert Card
+        // 10. Dispatch Enriched Read-Only Telegram Alert Card
         const targetChatId = process.env.ALLOWED_TELEGRAM_UID;
+
+        let diagnosisBlock = '';
+        if (triage) {
+            diagnosisBlock = `\n🔍 <b>Root Cause:</b> ${escapeHtml(triage.root_cause)}\n` +
+                `🎯 <b>Likely Culprit:</b> <code>${escapeHtml(triage.likely_culprit)}</code>\n` +
+                `💡 <b>Recommended Fix:</b> <code>${escapeHtml(triage.suggested_fix)}</code>\n`;
+        }
+
         const alertHtml = `🚨 <b>SentinelDev Alert: CI/CD Failure</b>\n\n` +
             `📦 <b>Repository:</b> <code>${escapeHtml(repoName)}</code>\n` +
             `⚙️ <b>Workflow:</b> ${escapeHtml(workflowName)}\n` +
             `🌿 <b>Branch:</b> <code>${escapeHtml(branch)}</code>\n` +
             `❌ <b>Conclusion:</b> <code>${escapeHtml(conclusion.toUpperCase())}</code>\n` +
             `👤 <b>Author:</b> ${escapeHtml(author)}\n` +
-            `📝 <b>Commit:</b> ${escapeHtml(commitMsg)}\n\n` +
-            `🔗 <a href="${runUrl}">View GitHub Actions Run</a>\n\n` +
+            `📝 <b>Commit:</b> ${escapeHtml(commitMsg)}\n` +
+            diagnosisBlock +
+            `\n🔗 <a href="${runUrl}">View GitHub Actions Run</a>\n\n` +
             `<i>SentinelDev read-only triage. Automated re-runs disabled.</i>`;
 
         if (targetChatId) {
             await sendTelegramAlert(targetChatId, alertHtml);
         }
 
-        await recordTelemetry('SentinelDev_Workflow', 'FAILURE_ALERTED', Date.now() - startTime, `Job: ${jobId} | ${repoName}`);
+        await recordTelemetry('SentinelDev_Workflow', 'FAILURE_TRIAGED', Date.now() - startTime, `Job: ${jobId} | ${repoName}`);
 
         return res.status(200).json({
             ok: true,
             job_id: jobId,
             status: 'RECEIVED',
-            conclusion
+            conclusion,
+            triaged: Boolean(triage)
         });
 
     } catch (fatalError) {
@@ -271,7 +379,6 @@ module.exports = async function handler(req, res) {
     }
 };
 
-// Disable Vercel automatic body parsing to preserve raw Buffer for HMAC validation
 module.exports.config = {
     api: {
         bodyParser: false,
