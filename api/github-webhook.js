@@ -1,20 +1,29 @@
 // api/github-webhook.js
 const crypto = require('crypto');
 
+const MAX_PAYLOAD_BYTES = 1024 * 1024; // 1 MB boundary
+
 /**
- * Reads the raw stream into a Buffer for byte-accurate HMAC verification.
+ * Reads the raw stream into a Buffer with hard 1 MB payload protection.
  */
 async function getRawBody(readable) {
     const chunks = [];
+    let totalBytes = 0;
+
     for await (const chunk of readable) {
-        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+        const bufferChunk = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+        totalBytes += bufferChunk.length;
+
+        if (totalBytes > MAX_PAYLOAD_BYTES) {
+            const err = new Error('PAYLOAD_TOO_LARGE');
+            err.code = 'PAYLOAD_TOO_LARGE';
+            throw err;
+        }
+        chunks.push(bufferChunk);
     }
     return Buffer.concat(chunks);
 }
 
-/**
- * Validates GitHub's HMAC-SHA256 signature in constant time.
- */
 function verifyGitHubSignature(rawBuffer, signatureHeader, secret) {
     if (!signatureHeader || !secret) return false;
     if (!signatureHeader.startsWith('sha256=')) return false;
@@ -30,9 +39,6 @@ function verifyGitHubSignature(rawBuffer, signatureHeader, secret) {
     return crypto.timingSafeEqual(sigBuffer, expectedBuffer);
 }
 
-/**
- * Escapes HTML entities to prevent malformed Telegram markup.
- */
 function escapeHtml(str) {
     return String(str || '')
         .replace(/&/g, '&amp;')
@@ -40,9 +46,6 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;');
 }
 
-/**
- * PostgREST helper communicating directly with Supabase via service_role key.
- */
 async function supabaseRequest(path, method, body, extraHeaders = {}) {
     const rawUrl = process.env.SUPABASE_URL;
     const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -76,9 +79,6 @@ async function supabaseRequest(path, method, body, extraHeaders = {}) {
     return { ok: response.ok, status: response.status, data };
 }
 
-/**
- * Records execution telemetry without throwing fatal exceptions.
- */
 async function recordTelemetry(workflow, outcome, durationMs, notes) {
     try {
         await supabaseRequest('roi_telemetry', 'POST', {
@@ -92,9 +92,6 @@ async function recordTelemetry(workflow, outcome, durationMs, notes) {
     }
 }
 
-/**
- * Fetches failed jobs and step details from GitHub REST API.
- */
 async function fetchFailedJobDetails(repoFullName, runId) {
     const pat = process.env.GITHUB_PAT;
     if (!pat || !runId) return null;
@@ -113,25 +110,19 @@ async function fetchFailedJobDetails(repoFullName, runId) {
         if (!res.ok) return null;
         const data = await res.json();
 
-        // Find failed jobs and isolate failed steps
         const failedJobs = (data.jobs || []).filter(j => j.conclusion === 'failure');
         if (failedJobs.length === 0) return null;
 
-        const summary = failedJobs.map(job => {
+        return failedJobs.map(job => {
             const failedSteps = (job.steps || []).filter(s => s.conclusion === 'failure').map(s => s.name);
             return `Job "${job.name}" failed on steps: ${failedSteps.join(', ') || 'unknown'}`;
         }).join('\n');
-
-        return summary;
     } catch (err) {
         console.error('GitHub API job fetch error:', err.message);
         return null;
     }
 }
 
-/**
- * Diagnoses build failure root cause using gemini-3.5-flash-lite.
- */
 async function diagnoseFailureWithGemini(failureContext) {
     const apiKey = String(process.env.GEMINI_API_KEY || '').trim().replace(/^["']|["']$/g, '');
     if (!apiKey) return null;
@@ -141,7 +132,7 @@ async function diagnoseFailureWithGemini(failureContext) {
 
     const systemPrompt = `You are SentinelDev, an expert CI/CD failure diagnostician.
 Analyze the provided GitHub Actions workflow failure metadata.
-Identify the root cause, the most likely culprit (file, package, or configuration), and a concrete fix command or code adjustment.
+Identify the root cause, likely culprit, and a concrete fix command or code adjustment.
 Keep the explanation direct, grounded, and concise.`;
 
     const responseSchema = {
@@ -183,9 +174,6 @@ Keep the explanation direct, grounded, and concise.`;
     }
 }
 
-/**
- * Dispatches an HTML-formatted notification to Telegram.
- */
 async function sendTelegramAlert(chatId, htmlText) {
     const botToken = process.env.TELEGRAM_BOT_TOKEN;
     if (!botToken) return false;
@@ -208,27 +196,36 @@ module.exports = async function handler(req, res) {
     const startTime = Date.now();
 
     try {
-        // 1. Health check for GET probes
         if (req.method === 'GET') {
-            return res.status(200).json({ status: 'healthy', milestone: '5b', service: 'SentinelDev' });
+            return res.status(200).json({ status: 'healthy', milestone: '6b', service: 'SentinelDev' });
         }
 
         if (req.method !== 'POST') {
             return res.status(405).json({ error: 'Method Not Allowed' });
         }
 
-        // 2. Read raw buffer for byte-exact HMAC calculation
-        const rawBuffer = await getRawBody(req);
+        // 1. Read raw buffer with 1 MB stream guard
+        let rawBuffer;
+        try {
+            rawBuffer = await getRawBody(req);
+        } catch (bodyErr) {
+            if (bodyErr.code === 'PAYLOAD_TOO_LARGE') {
+                await recordTelemetry('SentinelDev_Ingress', 'PAYLOAD_TOO_LARGE', Date.now() - startTime, 'Payload exceeded 1MB limit');
+                return res.status(413).json({ error: 'Payload Too Large: Maximum allowed size is 1MB' });
+            }
+            throw bodyErr;
+        }
+
         const signatureHeader = req.headers['x-hub-signature-256'];
         const webhookSecret = process.env.GITHUB_WEBHOOK_SECRET;
 
-        // 3. Cryptographic Signature Verification
+        // 2. Cryptographic Signature Verification
         if (!verifyGitHubSignature(rawBuffer, signatureHeader, webhookSecret)) {
             await recordTelemetry('SentinelDev_Ingress', 'AUTH_REJECTED', Date.now() - startTime, 'Invalid or missing HMAC signature');
             return res.status(401).json({ error: 'Unauthorized: Invalid webhook signature' });
         }
 
-        // 4. Parse JSON payload
+        // 3. Parse JSON payload
         let payload = {};
         try {
             payload = JSON.parse(rawBuffer.toString('utf8'));
@@ -239,13 +236,12 @@ module.exports = async function handler(req, res) {
         const eventType = req.headers['x-github-event'] || 'unknown';
         const deliveryId = req.headers['x-github-delivery'] || crypto.randomUUID();
 
-        // 5. Handle GitHub Webhook Ping
         if (eventType === 'ping') {
             await recordTelemetry('SentinelDev_Ingress', 'PING_RECEIVED', Date.now() - startTime, `Delivery: ${deliveryId}`);
             return res.status(200).json({ ok: true, message: 'pong', delivery_id: deliveryId });
         }
 
-        // 6. Idempotency Check in Supabase webhook_events
+        // 4. Idempotency Check in Supabase
         const eventInsert = await supabaseRequest('webhook_events', 'POST', {
             source: 'GITHUB',
             external_event_id: String(deliveryId),
@@ -262,7 +258,6 @@ module.exports = async function handler(req, res) {
             return res.status(500).json({ error: 'Failed to record event in database' });
         }
 
-        // 7. Filter for workflow_run completion
         if (eventType !== 'workflow_run') {
             return res.status(200).json({ ok: true, ignored_event: eventType });
         }
@@ -288,7 +283,7 @@ module.exports = async function handler(req, res) {
             return res.status(200).json({ ok: true, conclusion });
         }
 
-        // 8. Triage & Root Cause Analysis via GitHub API + Gemini
+        // 5. Triage & Root Cause Analysis via GitHub API + Gemini
         const stepDetails = await fetchFailedJobDetails(repoName, runId);
         const failureContext = `
 Repository: ${repoName}
@@ -303,7 +298,7 @@ ${stepDetails ? `Job Failure Details:\n${stepDetails}` : 'Job Details: Direct lo
 
         const triage = await diagnoseFailureWithGemini(failureContext);
 
-        // 9. Workflow Failure Staging in automation_jobs
+        // 6. Workflow Failure Staging in automation_jobs
         const jobId = crypto.randomUUID();
         const jobInsert = await supabaseRequest(
             'automation_jobs',
@@ -332,13 +327,10 @@ ${stepDetails ? `Job Failure Details:\n${stepDetails}` : 'Job Details: Direct lo
         if (!jobInsert.ok) {
             console.error('Failed to insert into automation_jobs:', jobInsert.data);
             await recordTelemetry('SentinelDev_Workflow', 'JOB_INSERT_FAILED', Date.now() - startTime, JSON.stringify(jobInsert.data));
-            return res.status(500).json({
-                error: 'Database persistence failed for automation_jobs',
-                details: jobInsert.data
-            });
+            return res.status(500).json({ error: 'Database persistence failed' });
         }
 
-        // 10. Dispatch Enriched Read-Only Telegram Alert Card
+        // 7. Dispatch Enriched Read-Only Telegram Alert Card
         const targetChatId = process.env.ALLOWED_TELEGRAM_UID;
 
         let diagnosisBlock = '';
@@ -375,7 +367,8 @@ ${stepDetails ? `Job Failure Details:\n${stepDetails}` : 'Job Details: Direct lo
 
     } catch (fatalError) {
         console.error('SentinelDev Invocation Crash:', fatalError);
-        return res.status(500).json({ error: 'Internal Server Error', details: fatalError.message });
+        // Sanitized envelope: Do not leak stack traces to client
+        return res.status(500).json({ error: 'Internal Server Error' });
     }
 };
 

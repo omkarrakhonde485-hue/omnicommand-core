@@ -1,6 +1,8 @@
 // api/telegram-webhook.js
 const crypto = require('crypto');
 
+const MAX_PAYLOAD_BYTES = 1024 * 1024; // 1 MB boundary
+
 function safeCompare(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
     const bufA = Buffer.from(a);
@@ -96,9 +98,6 @@ async function editTelegramMessage(chatId, messageId, text, parseMode = null) {
     });
 }
 
-/**
- * Calls Apps Script Calendar Worker to execute verified Google Calendar writes.
- */
 async function executeCalendarWrite(jobId, eventData) {
     const workerUrl = process.env.APPS_SCRIPT_CALENDAR_URL;
     const workerSecret = process.env.APPS_SCRIPT_WORKER_SECRET;
@@ -134,10 +133,6 @@ async function executeCalendarWrite(jobId, eventData) {
     return json;
 }
 
-/**
- * Extracts structured calendar parameters using Gemini API.
- * Uses gemini-3.5-flash-lite for fast, deterministic extraction.
- */
 async function parseEventWithGemini(userText) {
     const apiKey = String(process.env.GEMINI_API_KEY || '').trim().replace(/^["']|["']$/g, '');
     if (!apiKey) {
@@ -209,14 +204,21 @@ module.exports = async function handler(req, res) {
 
     try {
         if (req.method === 'GET') {
-            return res.status(200).json({ status: 'healthy', milestone: 3, part: 'B' });
+            return res.status(200).json({ status: 'healthy', milestone: '6b', service: 'OmniCommand' });
         }
 
         if (req.method !== 'POST') {
             return res.status(405).json({ error: 'Method Not Allowed' });
         }
 
-        // 1. Header Authentication Check
+        // 1. Payload size guard
+        const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+        if (contentLength > MAX_PAYLOAD_BYTES) {
+            await recordTelemetry('OmniCommand_Ingress', 'PAYLOAD_TOO_LARGE', Date.now() - startTime, `Length: ${contentLength}`);
+            return res.status(413).json({ error: 'Payload Too Large: Maximum allowed size is 1MB' });
+        }
+
+        // 2. Header Authentication Check
         const incomingSecret = req.headers['x-telegram-bot-api-secret-token'];
         const expectedSecret = process.env.TG_SECRET_TOKEN;
 
@@ -234,7 +236,7 @@ module.exports = async function handler(req, res) {
 
         const allowedUid = String(process.env.ALLOWED_TELEGRAM_UID || '').trim();
 
-        // 2. Branch A: Handle Approval Callbacks (callback_query)
+        // 3. Branch A: Handle Approval Callbacks
         if (payload.callback_query) {
             const cb = payload.callback_query;
             const senderId = cb.from && cb.from.id ? String(cb.from.id) : '';
@@ -256,7 +258,6 @@ module.exports = async function handler(req, res) {
 
             const newStatus = action === 'app' ? 'APPROVED' : 'REJECTED';
 
-            // Atomic State Transition via Supabase RPC
             const rpcResult = await supabaseRequest('rpc/transition_job_status', 'POST', {
                 p_job_id: jobId,
                 p_expected_status: 'PENDING_APPROVAL',
@@ -272,7 +273,6 @@ module.exports = async function handler(req, res) {
 
             const outcome = rpcResult.data;
 
-            // Duplicate / Expired Protection
             if (!outcome.success) {
                 let alertMessage = 'Action could not be applied.';
                 if (outcome.reason === 'INVALID_STATE_TRANSITION') {
@@ -288,7 +288,6 @@ module.exports = async function handler(req, res) {
 
             const jobRecord = outcome.job;
 
-            // Handle Rejection
             if (newStatus === 'REJECTED') {
                 await answerCallbackQuery(cb.id, 'Action rejected');
                 if (chatId && messageId) {
@@ -298,14 +297,12 @@ module.exports = async function handler(req, res) {
                 return res.status(200).json({ ok: true, job_id: jobId, status: 'REJECTED' });
             }
 
-            // Handle Approval -> Execute Calendar Write
             await answerCallbackQuery(cb.id, 'Scheduling on Google Calendar...');
 
             try {
                 const eventData = jobRecord.parsed_payload;
                 const calendarResult = await executeCalendarWrite(jobId, eventData);
 
-                // Update Job to EXECUTED with Verified Calendar Event ID
                 await supabaseRequest(`automation_jobs?job_id=eq.${jobId}`, 'PATCH', {
                     status: 'EXECUTED',
                     parsed_payload: {
@@ -315,7 +312,6 @@ module.exports = async function handler(req, res) {
                     updated_at: new Date().toISOString()
                 });
 
-                // Edit Telegram Card to Show Verified Success
                 if (chatId && messageId) {
                     const successCard = `✅ *Scheduled on Google Calendar!*\n\n` +
                         `*Title:* ${calendarResult.title}\n` +
@@ -332,7 +328,6 @@ module.exports = async function handler(req, res) {
             } catch (execErr) {
                 console.error('Calendar execution failure:', execErr);
 
-                // Transition Job to FAILED in Supabase
                 await supabaseRequest(`automation_jobs?job_id=eq.${jobId}`, 'PATCH', {
                     status: 'FAILED',
                     error_message: execErr.message,
@@ -344,11 +339,11 @@ module.exports = async function handler(req, res) {
                 }
 
                 await recordTelemetry('OmniCommand_Execution', 'FAILED', Date.now() - startTime, execErr.message);
-                return res.status(200).json({ ok: true, error: execErr.message });
+                return res.status(200).json({ ok: true, error: 'Calendar execution failed' });
             }
         }
 
-        // 3. Branch B: Handle Standard Text Messages (message)
+        // 4. Branch B: Handle Standard Text Messages
         const message = payload.message || payload.edited_message;
         if (!message || typeof message.text !== 'string') {
             return res.status(200).json({ ok: true, ignored: 'non_text_update' });
@@ -363,7 +358,6 @@ module.exports = async function handler(req, res) {
             return res.status(200).json({ ok: true, rejected: 'unauthorized_user' });
         }
 
-        // Idempotency Check
         const eventInsert = await supabaseRequest('webhook_events', 'POST', {
             source: 'TELEGRAM',
             external_event_id: updateId,
@@ -380,20 +374,18 @@ module.exports = async function handler(req, res) {
             return res.status(500).json({ error: 'Database persistence failed' });
         }
 
-        // /ping command
         if (text === '/ping') {
-            await sendTelegramMessage(chatId, '✅ Pong! OmniCommand Milestone 3B is live.');
+            await sendTelegramMessage(chatId, '✅ Pong! OmniCommand Milestone 6B is live.');
             await recordTelemetry('OmniCommand_Ingress', 'SUCCESS', Date.now() - startTime, 'Ping command');
             return res.status(200).json({ ok: true, command: '/ping' });
         }
 
-        // Parse Intent with Gemini
         let parsedData = null;
         try {
             parsedData = await parseEventWithGemini(text);
         } catch (aiErr) {
             console.error('Gemini parsing error:', aiErr);
-            await sendTelegramMessage(chatId, `⚠️ AI Parsing Error: ${aiErr.message}`);
+            await sendTelegramMessage(chatId, `⚠️ AI Parsing Error: Service temporarily unavailable.`);
             await recordTelemetry('OmniCommand_Parser', 'AI_ERROR', Date.now() - startTime, aiErr.message);
             return res.status(200).json({ ok: true, error: 'ai_parse_failed' });
         }
@@ -411,7 +403,6 @@ module.exports = async function handler(req, res) {
             return res.status(200).json({ ok: true, status: 'incomplete_input' });
         }
 
-        // Complete Calendar Event: Stage Job and Send Approval Card
         const jobId = crypto.randomUUID();
         const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
@@ -454,7 +445,7 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true, job_id: jobId, status: 'PENDING_APPROVAL' });
 
     } catch (fatalError) {
-        console.error('Unhandled invocation crash:', fatalError);
-        return res.status(500).json({ error: 'Internal Server Error', details: fatalError.message });
+        console.error('OmniCommand Fatal Crash:', fatalError);
+        return res.status(500).json({ error: 'Internal Server Error' });
     }
 };
